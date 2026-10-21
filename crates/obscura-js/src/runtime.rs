@@ -642,7 +642,14 @@ impl ObscuraJsRuntime {
             deno_core::v8::icu::set_default_locale("en-US");
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
-                extensions: vec![build_extension()],
+                extensions: if cfg!(obscura_external_bootstrap) {
+                    vec![deno_core::Extension {
+                        name: "obscura_bootstrap",
+                        ..Default::default()
+                    }, build_extension()]
+                } else {
+                    vec![build_extension()]
+                },
                 module_loader: Some(module_loader),
                 startup_snapshot: Some(SNAPSHOT),
                 ..Default::default()
@@ -2620,117 +2627,72 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<CdpEvaluation, String> {
-        // Every shape of this command now travels the same path. The
-        // by-value sync case used to short-circuit through `evaluate`,
-        // whose wrapper answers an exception with `null` — indistinguishable
-        // from an expression that really evaluated to null (#746).
         self.begin_javascript_task();
-
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
-
-        // The expression travels as a *string* into an indirect eval rather
-        // than being pasted into a wrapper. Pasting forced two workarounds
-        // that only half worked: a trailing `;` had to be trimmed or
-        // `(expr;)` failed to parse, and a trailing `//# sourceURL=` comment
-        // (Puppeteer and Playwright both append one) would swallow the
-        // closing paren unless it sat on its own line. Neither can happen to
-        // a string literal.
-        //
-        // It also makes statements legal. `Runtime.evaluate` is specified to
-        // take a script, not an expression, so `throw new Error('x')` and
-        // `var x = 1; x * 2` are both valid input; wrapped in parentheses the
-        // first was a parse-time SyntaxError, which is not catchable, and the
-        // second returned the wrapper's own `undefined` instead of the
-        // completion value Chrome reports (#746).
-        //
-        // `(0, eval)` rather than `eval` so the script runs at global scope,
-        // where `var` lands on `globalThis` the way it does in Chrome, and
-        // cannot see this wrapper's `__result`.
-        let source_literal = serde_json::Value::String(expression.to_string());
-        let meta_code = if await_promise {
-            format!(
-                "(function() {{\n\
-                    var pending = {{done:false,rejected:false,value:undefined}};\n\
-                    (async function() {{\n\
-                        try {{ pending.value = await (0, eval)({src}); }}\n\
-                        catch(e) {{ pending.value = e; pending.rejected = true; }}\n\
-                        pending.done = true;\n\
-                    }})();\n\
-                    return pending;\n\
-                }})()",
-                src = source_literal,
-            )
-        } else {
-            // Before this, a throw here became `__result = undefined`: the
-            // command answered successfully with `undefined`, so a page error
-            // was indistinguishable from an expression with no value.
-            format!(
-                "(function() {{\n\
-                    var __result;\n\
-                    try {{\n\
-                        __result = (0, eval)({src});\n\
-                    }} catch(e) {{\n\
-                        globalThis.__obscura_objects[{oid}] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
-                        return globalThis.__obscura_await_meta;\n\
-                    }}\n\
-                    globalThis.__obscura_objects[{oid}] = __result;\n\
-                    globalThis.__obscura_await_rejected = false;\n\
-                    return {meta_fn};\n\
-                }})()",
-                src = source_literal,
-                oid = js_string_literal(&oid),
-                meta_fn = Self::meta_extract_js("__result"),
-                err_meta_fn = Self::meta_extract_js("e"),
-            )
+        // Compile the script itself, not a string passed through the page's eval.
+        let record = (|| {
+            let mut entered = self.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let source = v8::String::new(scope, expression).ok_or("CDP source allocation failed")?;
+            let name = v8::String::new(scope, "<eval-remote>").ok_or("CDP origin allocation failed")?;
+            let origin = v8::ScriptOrigin::new(
+                scope, name.into(), 0, 0, false, 0, None, false, false, false, None,
+            );
+            let result = v8::Script::compile(scope, source, Some(&origin))
+                .and_then(|script| script.run(scope));
+            if scope.is_execution_terminating() {
+                scope.cancel_terminate_execution();
+                return Err("JS error: Uncaught Error: execution terminated".to_string());
+            }
+            let rejected = result.is_none();
+            let value = result.or_else(|| scope.exception())
+                .ok_or("CDP evaluation failed without an exception")?;
+            scope.reset();
+            let should_await = await_promise && !rejected;
+            let pending = v8::Object::new(scope);
+            let done = v8::Boolean::new(scope, !should_await);
+            let rejected = v8::Boolean::new(scope, rejected);
+            let initial_value = if should_await { v8::undefined(scope).into() } else { value };
+            for (name, value) in [
+                ("done", done.into()), ("rejected", rejected.into()), ("value", initial_value),
+            ] {
+                let key = v8::String::new(scope, name).ok_or("CDP result key allocation failed")?;
+                if pending.create_data_property(scope, key.into(), value) != Some(true) {
+                    return Err("CDP result allocation failed".to_string());
+                }
+            }
+            if should_await {
+                // Await assimilates thenables without consulting the page's Promise constructor.
+                let source = v8::String::new(scope, r#"(async function(value, pending) {
+                    try { pending.value = await value; }
+                    catch (error) { pending.value = error; pending.rejected = true; }
+                    pending.done = true;
+                })"#).ok_or("CDP await allocation failed")?;
+                let function = v8::Script::compile(scope, source, None)
+                    .and_then(|script| script.run(scope))
+                    .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+                    .ok_or_else(|| exception_text(scope))?;
+                let receiver = v8::undefined(scope).into();
+                function.call(scope, receiver, &[value, pending.into()])
+                    .ok_or_else(|| exception_text(scope))?;
+            }
+            let pending: v8::Local<v8::Value> = pending.into();
+            Ok(v8::Global::new(scope, pending))
+        })();
+        let record = self.finish_heap_checked(record)?;
+        self.pending_cdp_evaluations.insert(oid.clone(), record);
+        let pending = PendingCdpEvaluation {
+            object_id: oid,
+            recipe: if return_by_value { None } else { Some(expression.to_string()) },
         };
-
-        let result = self
-            .execute_runtime_script("<eval-remote>", meta_code)
-            .map_err(|e| format!("JS error: {}", e))?;
-
         if await_promise {
-            self.pending_cdp_evaluations.insert(oid.clone(), result);
-            return Ok(CdpEvaluation::Pending(PendingCdpEvaluation {
-                object_id: oid,
-                recipe: if return_by_value { None } else { Some(expression.to_string()) },
-            }));
-        }
-        let meta_str = result;
-
-        // Neither a rejection nor a synchronous throw is a protocol failure.
-        // CDP answers the command and puts the value in `exceptionDetails`,
-        // which is what a client rebuilds the page error from, so it travels
-        // back as a remote object flagged `thrown`. It is reported by
-        // reference even when the caller asked for a value:
-        // `JSON.stringify(new Error("boom"))` is `{}`, so serializing it
-        // would throw the message away.
-        let thrown = self
-            .execute_runtime_script(
-                "<readRejected>",
-                "globalThis.__obscura_await_rejected".to_string(),
-            )
-            .map_err(|e| format!("JS error: {}", e))?;
-        if self.v8_to_json(thrown)?.as_bool().unwrap_or(false) {
-            return self.thrown_info(&oid).map(CdpEvaluation::Complete);
-        }
-        if return_by_value {
-            return self.take_cdp_result_by_value(&oid).map(CdpEvaluation::Complete);
-        }
-        let meta_str = self.v8_to_json(meta_str)?;
-        let meta_json = if let serde_json::Value::String(s) = &meta_str {
-            serde_json::from_str(s).unwrap_or(meta_str)
+            Ok(CdpEvaluation::Pending(pending))
         } else {
-            meta_str
-        };
-        let info = self.finish_cdp_result(&meta_json, &oid)?;
-        // The eval-based wrapper parses the expression as statements.
-        if info.object_id.is_some() {
-            self.evaluation_recipes.insert(oid, expression.to_string());
+            self.finish_cdp_evaluation(pending, return_by_value).map(CdpEvaluation::Complete)
         }
-        Ok(CdpEvaluation::Complete(info))
     }
 
     pub async fn call_function_on_for_cdp(
@@ -4585,29 +4547,6 @@ impl ObscuraJsRuntime {
         }
     }
 
-    /// Build the remote object for a value that was thrown, or that a promise
-    /// rejected with.
-    ///
-    /// Both wrappers have already stored the value under `oid` and put its
-    /// metadata in `__obscura_await_meta`, so this reads them back and marks
-    /// the result. The mark is what lets the CDP layer answer the command with
-    /// `exceptionDetails` rather than fail it or, worse, present the value as
-    /// the evaluation result.
-    fn thrown_info(&mut self, oid: &str) -> Result<RemoteObjectInfo, String> {
-        let meta = self
-            .execute_runtime_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
-            .map_err(|e| format!("JS error: {}", e))?;
-        let meta = self.v8_to_json(meta)?;
-        let meta_json = if let serde_json::Value::String(text) = &meta {
-            serde_json::from_str(text).unwrap_or_else(|_| meta.clone())
-        } else {
-            meta
-        };
-        let mut info = self.finish_cdp_result(&meta_json, oid)?;
-        info.thrown = true;
-        Ok(info)
-    }
-
     fn info_from_meta(meta: &serde_json::Value, object_id: Option<String>) -> RemoteObjectInfo {
         let js_type = meta
             .get("type")
@@ -4650,6 +4589,27 @@ impl Default for ObscuraJsRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_source_uses_ascii_snapshot_storage() {
+        let source = include_str!("../js/bootstrap.js")
+            .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"));
+        assert!(source.is_ascii(), "use Unicode escapes in bootstrap literals so source can be shared");
+        if cfg!(obscura_external_bootstrap) {
+            assert_eq!(super::SNAPSHOT.windows(source.len())
+                .filter(|window| *window == source.as_bytes()).count(), 1,
+                "native snapshots must retain one shared source backing");
+        }
+    }
+
+    #[test]
+    fn custom_element_names_keep_unicode_characters() {
+        let mut rt = setup_runtime("<main></main>");
+        assert_eq!(rt.evaluate(r#"['widget-\u00e9','widget-\u00b7','widget-\u0100'].every(name => {
+            customElements.define(name, class extends HTMLElement {});
+            return typeof customElements.get(name) === 'function';
+        })"#).unwrap(), serde_json::json!(true));
+    }
+
     #[test]
     fn classic_code_cache_reuses_compilation_not_page_state() {
         use std::sync::atomic::Ordering;
@@ -6933,6 +6893,112 @@ mod tests {
             )
             .unwrap();
         assert_eq!(path, serde_json::json!("/dashboard"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn location_hash_navigates_to_a_fragment_in_the_same_document() {
+        let mut rt = setup_runtime("<html><body><a id=tab href='#tab'>tab</a></body></html>");
+        rt.execute_script(
+            "fragment-navigation",
+            r#"
+                globalThis.__events = [];
+                addEventListener('hashchange', (e) => __events.push(e.oldURL + ' -> ' + e.newURL));
+                globalThis.__marker = 'same-document';
+                location.hash = 'one';
+                globalThis.__syncHash = location.hash;
+                location.hash = '#one';
+                location.href = '#two';
+                document.getElementById('tab').click();
+            "#,
+        )
+        .unwrap();
+        assert_eq!(rt.take_pending_navigation(), None, "a fragment change must not load a new document");
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt
+            .evaluate("[__syncHash, location.href, history.length, __marker, __events]")
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "#one",
+                "http://example.com/test#tab",
+                4,
+                "same-document",
+                [
+                    "http://example.com/test -> http://example.com/test#one",
+                    "http://example.com/test#one -> http://example.com/test#two",
+                    "http://example.com/test#two -> http://example.com/test#tab",
+                ],
+            ])
+        );
+        rt.evaluate("history.back()").unwrap();
+        assert_eq!(rt.evaluate("location.hash").unwrap(), serde_json::json!("#two"));
+    }
+
+    #[test]
+    fn location_replace_with_a_fragment_replaces_the_history_entry() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate("(function(){ location.replace('#r'); return [location.hash, history.length]; })()")
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["#r", 1]));
+        assert_eq!(rt.take_pending_navigation(), None);
+    }
+
+    #[test]
+    fn location_component_setters_load_the_new_url() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("location.search = 'q=1'").unwrap();
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some(("http://example.com/test?q=1".into(), "GET".into(), String::new())),
+        );
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("location.pathname = '/other'").unwrap();
+        assert_eq!(
+            rt.take_pending_navigation().map(|(url, _, _)| url),
+            Some("http://example.com/other".into()),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn location_hash_preserves_leading_hashes_and_ignores_an_unchanged_empty_fragment() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("hash-setter", r#"
+            globalThis.__hashEvents = [];
+            addEventListener('hashchange', e => __hashEvents.push([e.oldURL, e.newURL]));
+            location.hash = '';
+            location.hash = '#';
+            globalThis.__emptyHashResult = [location.href, history.length];
+            location.hash = '##panel';
+            location.hash = '##panel';
+        "#).unwrap();
+        assert_eq!(rt.take_pending_navigation(), None);
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[__emptyHashResult, location.href, location.hash, history.length, __hashEvents]").unwrap(),
+            serde_json::json!([
+                ["http://example.com/test", 1],
+                "http://example.com/test##panel", "##panel", 2,
+                [["http://example.com/test", "http://example.com/test##panel"]],
+            ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_fragment_navigation_preserves_history_state() {
+        let mut rt = setup_runtime("<html><body><a id=tab href='#panel'>tab</a></body></html>");
+        rt.execute_script("same-fragment", r#"
+            history.replaceState({saved: 1}, '', '#panel');
+            globalThis.__sameHashEvents = 0;
+            addEventListener('hashchange', () => __sameHashEvents++);
+            location.assign('#panel');
+            location.href = '#panel';
+            location.replace('#panel');
+            document.getElementById('tab').click();
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.take_pending_navigation(), None);
+        assert_eq!(rt.evaluate("[history.state, history.length, location.hash, __sameHashEvents]").unwrap(),
+            serde_json::json!([{ "saved": 1 }, 1, "#panel", 0]));
     }
 
     #[test]
@@ -9394,6 +9460,105 @@ mod tests {
         assert_eq!(result, serde_json::json!([
             true, true, true, true,
             [false, false, false, false, false, false]
+        ]));
+    }
+
+    #[test]
+    fn list_element_brands_survive_parsing_creation_and_cloning() {
+        let mut rt = setup_runtime("<html><body><ol><li>item</li></ol></body></html>");
+        let result = rt.evaluate(r#"
+            return [['ol', HTMLOListElement], ['li', HTMLLIElement]].map(([tag, C]) => {
+                const parsed = document.querySelector(tag);
+                const created = document.createElement(tag);
+                const nodes = [parsed, created, parsed.cloneNode(true), created.cloneNode(),
+                    document.importNode(parsed, true)];
+                return [nodes.map(node => node instanceof C && node instanceof HTMLElement
+                    && node.constructor === C), Object.prototype.toString.call(created),
+                    [document.createElement('div'), document.createElement('ul'),
+                        document.createElementNS('urn:test', tag),
+                        document.createElementNS('urn:test', tag.toUpperCase()).cloneNode(),
+                        document.createElementNS('http://www.w3.org/2000/svg', tag)]
+                        .map(node => node instanceof C)];
+            });
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [[true, true, true, true, true], "[object HTMLOListElement]",
+                [false, false, false, false, false]],
+            [[true, true, true, true, true], "[object HTMLLIElement]",
+                [false, false, false, false, false]]
+        ]));
+    }
+
+    #[test]
+    fn list_element_properties_reflect_boolean_and_string_attributes() {
+        let mut rt = setup_runtime(
+            "<html><body><ol reversed start='-2' type='A'><li value='-4'>item</li></ol></body></html>",
+        );
+        let result = rt.evaluate(r#"
+            const parsed = document.querySelector('ol');
+            const list = document.createElement('ol');
+            const initial = [parsed.reversed, parsed.start, parsed.type,
+                document.querySelector('li').value, list.reversed, list.start, list.type];
+            const states = [];
+            list.reversed = true;
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.reversed = false;
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.setAttribute('reversed', 'false');
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.removeAttribute('reversed');
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.type = 'i';
+            const written = [list.type, list.getAttribute('type')];
+            list.setAttribute('type', 'invalid');
+            const changed = list.type;
+            list.removeAttribute('type');
+            const removed = list.type;
+            list.type = null;
+            return [initial, states, written, changed, removed, list.getAttribute('type'),
+                'reversed' in document.createElement('div'),
+                'start' in document.createElement('li'),
+                ['reversed', 'start', 'type'].every(name =>
+                    Object.getOwnPropertyDescriptor(HTMLOListElement.prototype, name)?.enumerable),
+                Object.getOwnPropertyDescriptor(HTMLLIElement.prototype, 'value')?.enumerable];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [true, -2, "A", -4, false, 1, ""],
+            [[true, ""], [false, null], [true, "false"], [false, null]],
+            ["i", "i"], "invalid", "", "null", false, false,
+            true, true
+        ]));
+    }
+
+    #[test]
+    fn list_element_integer_reflection_defaults_parses_and_wraps() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const list = document.createElement('ol');
+            const item = document.createElement('li');
+            const attributes = [null, '', 'invalid', '  +12tail', '-3.8',
+                '2147483648', '-2147483649', '99999999999999999999', '0x10'].map(value => {
+                if (value === null) { list.removeAttribute('start'); item.removeAttribute('value'); }
+                else { list.setAttribute('start', value); item.setAttribute('value', value); }
+                return [list.start, item.value];
+            });
+            const setters = [4294967297, 2147483648, -2147483649, NaN, Infinity,
+                -0, 3.8, null].map(value => {
+                list.start = value;
+                item.value = value;
+                return [list.start, list.getAttribute('start'), item.value, item.getAttribute('value')];
+            });
+            const bigints = [[list, 'start'], [item, 'value'], [list, 'tabIndex']].map(([node, key]) => {
+                try { node[key] = 1n; return 'accepted'; } catch (error) { return error.name; }
+            });
+            return [attributes, setters, bigints];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [[1, 0], [1, 0], [1, 0], [12, 12], [-3, -3], [1, 0], [1, 0], [1, 0], [0, 0]],
+            [[1, "1", 1, "1"], [-2147483648i64, "-2147483648", -2147483648i64, "-2147483648"],
+                [2147483647, "2147483647", 2147483647, "2147483647"], [0, "0", 0, "0"],
+                [0, "0", 0, "0"], [0, "0", 0, "0"], [3, "3", 3, "3"], [0, "0", 0, "0"]],
+            ["TypeError", "TypeError", "TypeError"]
         ]));
     }
 
@@ -18911,6 +19076,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cdp_evaluation_does_not_call_the_pages_eval() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.evaluate_script("globalThis.eval = () => { throw new Error('page eval called'); };").unwrap();
+        for await_promise in [false, true] {
+            let result = rt.evaluate_for_cdp("6 * 7", true, await_promise).await.unwrap();
+            assert!(!result.thrown);
+            assert_eq!(result.value, Some(serde_json::json!(42.0)));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cdp_evaluation_preserves_global_lexical_bindings() {
+        let mut rt = ObscuraJsRuntime::new();
+        for (name, await_promise) in [("syncLexical", false), ("asyncLexical", true)] {
+            let declaration = format!("let {name} = 40; {name}");
+            let first = rt.evaluate_for_cdp(&declaration, true, await_promise).await.unwrap();
+            assert_eq!(first.value, Some(serde_json::json!(40.0)));
+            let second = rt.evaluate_for_cdp(&format!("{name} += 2; {name}"), true, await_promise).await.unwrap();
+            assert!(!second.thrown);
+            assert_eq!(second.value, Some(serde_json::json!(42.0)));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cdp_by_value_results_do_not_retain_unreleasable_objects() {
         let mut rt = ObscuraJsRuntime::new();
         // A real remote handle must survive by-value calls until released.
@@ -24561,9 +24750,7 @@ mod tests {
 
     /// Playwright >= 1.25 calls `element.checkVisibility(...)` before every
     /// input event. If the method isn't defined Playwright retries until its
-    /// action timeout fires. Without a layout engine we can't compute it
-    /// properly, so the stub always returns true — still strictly better
-    /// than the undefined path.
+    /// action timeout fires, so it must exist and be true for plain elements.
     #[test]
     fn element_check_visibility_is_callable() {
         let mut rt = setup_runtime(r#"<div id="x">x</div>"#);
@@ -24576,6 +24763,84 @@ mod tests {
             .evaluate("typeof document.getElementById('x').checkVisibility")
             .unwrap();
         assert_eq!(typeof_method, serde_json::json!("function"));
+    }
+
+    /// Issue #1067: checkVisibility() follows the CSSOM View algorithm:
+    /// elements without a box (display:none on self or an ancestor,
+    /// display:contents, disconnected) are hidden, and the opacity /
+    /// visibility options are honored, including their legacy aliases.
+    #[test]
+    fn element_check_visibility_follows_css_boxes_and_options() {
+        let mut rt = setup_runtime(
+            r#"
+            <div style="display:none"><a id="a" href="/x">hidden</a></div>
+            <div style="visibility:hidden"><a id="b" href="/x">invisible</a></div>
+            <div style="opacity:0"><span id="c">transparent</span></div>
+            <span id="e" style="display:contents">contents</span>
+            <span id="f" style="display:none">self none</span>
+            <div style="visibility:hidden"><span id="g" style="visibility:visible">back</span></div>
+            <a id="v" href="/x">visible</a>
+            "#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const $ = id => document.getElementById(id);
+                return [
+                  $('a').checkVisibility(),
+                  $('b').checkVisibility(),
+                  $('b').checkVisibility({visibilityProperty: true}),
+                  $('b').checkVisibility({checkVisibilityCSS: true}),
+                  $('c').checkVisibility(),
+                  $('c').checkVisibility({opacityProperty: true}),
+                  $('c').checkVisibility({checkOpacity: true}),
+                  $('e').checkVisibility(),
+                  $('f').checkVisibility(),
+                  $('g').checkVisibility({visibilityProperty: true}),
+                  $('v').checkVisibility({visibilityProperty: true, opacityProperty: true}),
+                  document.createElement('div').checkVisibility(),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                false, true, false, false, true, false, false, false, false, true, true, false
+            ])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn element_check_visibility_uses_flat_tree_box_presence() {
+        let mut rt = setup_runtime(r#"<details><summary id="summary">show</summary>
+            <span id="closed">closed</span></details><div id="host"><span id="unslotted">light</span></div>
+            <div id="zero" style="width:0;height:0"></div><span id="empty"></span>
+            <table><tr id="row" style="display:none"><td>hidden</td></tr></table>"#);
+        let result = rt.evaluate(r#"(() => {
+            const root = document.getElementById('host').attachShadow({mode:'open'});
+            root.innerHTML = '<span id="shadow">shadow</span>';
+            return ['summary','closed','unslotted','zero','empty','row'].map(id =>
+                document.getElementById(id).checkVisibility()).concat(root.getElementById('shadow').checkVisibility());
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true,false,false,true,true,false,true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn element_check_visibility_uses_the_owning_frame() {
+        let mut rt = setup_runtime("<div style='display:none'><span>parent hidden</span></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const d = iframe.contentDocument;
+            d.body.innerHTML = '<div id="shown">child</div><div id="hidden" style="display:none">hidden</div>';
+            const shown = d.getElementById('shown'), hidden = d.getElementById('hidden');
+            const parentCheck = Element.prototype.checkVisibility;
+            return [shown.checkVisibility(),hidden.checkVisibility(),
+                parentCheck.call(shown),parentCheck.call(hidden)];
+        })()"#).unwrap(), serde_json::json!([true,false,true,false]));
     }
 
     /// Playwright's `getByRole` / `getByLabel` locators resolve via ARIA
